@@ -15,6 +15,9 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# Remove the default help command so we can use our own
+bot.remove_command('help')
+
 # Bot info
 APP_VERSION = "2.1.0"
 SUPPORTED_EXCHANGES = ["Binance", "Bybit", "Coinbase", "Kraken", "KuCoin", "OKX", "Hyperliquid"]
@@ -87,7 +90,6 @@ async def on_ready():
 
 @bot.event
 async def on_command_error(ctx, error):
-    """Fixed error handler - uses full exception path"""
     if isinstance(error, discord.ext.commands.errors.CommandNotFound):
         await ctx.send(f"❌ Unknown command. Type `!help` for available commands.")
     else:
@@ -147,7 +149,7 @@ async def security(ctx):
     await ctx.send(embed=embed)
 
 # ============================================
-# HELP COMMAND (was 'commands' - fixed name conflict)
+# HELP COMMAND (fixed conflict with built-in help)
 # ============================================
 
 @bot.command()
