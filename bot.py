@@ -13,11 +13,7 @@ import json
 # Load environment variables
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-BEARER_TOKEN = os.getenv('BEARER_TOKEN')
-
-# If .env didn't have it, fallback to hardcoded value (replace placeholder)
-if not BEARER_TOKEN:
-    BEARER_TOKEN = "your_twitter_bearer_token_here"
+BEARER_TOKEN = os.getenv('BEARER_TOKEN')   # Read from .env – no fallback
 
 # Bot configuration
 intents = discord.Intents.all()
@@ -31,25 +27,27 @@ SUPPORTED_EXCHANGES = ["Binance", "Bybit", "Coinbase", "Kraken", "KuCoin", "OKX"
 # TWITTER FUD / LARGE WITHDRAWAL ALERTS
 # ============================================
 
-if BEARER_TOKEN and BEARER_TOKEN != "your_twitter_bearer_token_here":
+# Only initialize if token is present and not empty
+if BEARER_TOKEN:
     TWITTER_CLIENT = tweepy.Client(bearer_token=BEARER_TOKEN)
 else:
     TWITTER_CLIENT = None
+    print("⚠️ BEARER_TOKEN not set in .env – FUD alerts disabled.")
 
 PROCESSED_FILE = "processed_tweets.json"
 
-# Very low thresholds to catch almost anything
+# Very low thresholds – catch almost anything
 WITHDRAWAL_THRESHOLD = {
-    "BTC": 1,
-    "ETH": 10,
-    "USDT": 10000,
-    "USDC": 10000,
-    "DAI": 10000,
-    "XRP": 1000,
-    "ADA": 1000,
-    "SOL": 100,
-    "DOT": 100,
-    "AVAX": 100
+    "BTC": 0.1,
+    "ETH": 1,
+    "USDT": 1000,
+    "USDC": 1000,
+    "DAI": 1000,
+    "XRP": 100,
+    "ADA": 100,
+    "SOL": 10,
+    "DOT": 10,
+    "AVAX": 10
 }
 
 # Expanded FUD keywords
@@ -57,7 +55,9 @@ FUD_TRIGGER_WORDS = [
     "bank run", "insolvent", "freeze withdrawals", "halt withdrawals",
     "collapse", "hack", "exploit", "panic", "suspends withdrawals",
     "liquidity crisis", "scam", "rug", "exit scam", "bankrupt",
-    "withdrawal issue", "can't withdraw", "withdrawal delay"
+    "withdrawal issue", "can't withdraw", "withdrawal delay",
+    "withdrawal problem", "stuck withdrawal", "withdrawal halted",
+    "funds frozen", "panic sell", "crash"
 ]
 
 fud_last_run = None
@@ -75,7 +75,8 @@ def save_processed_ids(ids):
         json.dump(list(ids), f)
 
 def analyze_tweet(text):
-    pattern = r'(\d{1,3}(?:,\d{3})*)\s*(BTC|ETH|USDT|USDC|DAI|XRP|ADA|SOL|DOT|AVAX)'
+    # Improved regex: handles both 1,000 and 1000
+    pattern = r'(\d{1,3}(?:,\d{3})*|\d+)\s*(BTC|ETH|USDT|USDC|DAI|XRP|ADA|SOL|DOT|AVAX)'
     for match in re.finditer(pattern, text, re.IGNORECASE):
         raw = match.group(1).replace(",", "")
         amount = float(raw)
@@ -93,10 +94,9 @@ def fetch_twitter_fud_tweets():
         return []
     query = (
         "(binance OR coinbase OR kraken OR bybit OR ftx OR okx OR huobi OR kucoin OR gate.io OR crypto.com OR exchange) "
-        "AND (withdraw* OR outflow* OR deposit* OR transfer* OR fud OR panic OR bank run OR insolvent OR freeze OR halt OR collapse OR hack OR scam OR rug) "
+        "AND (withdraw* OR outflow* OR deposit* OR transfer* OR fud OR panic OR bank run OR insolvent OR freeze OR halt OR collapse OR hack OR scam OR rug OR crash OR \"can't withdraw\" OR \"withdrawal issue\") "
         "-is:retweet -is:reply lang:en"
     )
-    # end_time must be at least 10 seconds before now
     end_time = datetime.utcnow() - timedelta(seconds=30)
     start_time = end_time - timedelta(hours=24)
     try:
@@ -242,7 +242,7 @@ async def on_command_error(ctx, error):
         print(f"Error: {error}")
 
 # ============================================
-# EXISTING COMMANDS (FULL, UNCHANGED)
+# ORIGINAL COMMANDS (preserved in full)
 # ============================================
 
 @bot.command()
@@ -815,7 +815,7 @@ async def support(ctx, withdrawal_id: str = None):
 @bot.command()
 async def fud(ctx):
     if not TWITTER_CLIENT:
-        await ctx.send("❌ Twitter API not configured. Please set BEARER_TOKEN.")
+        await ctx.send("❌ Twitter API not configured. Please set BEARER_TOKEN in .env.")
         return
     await ctx.send("🔍 Scanning Twitter for exchange FUD and large withdrawals...")
     alerts = await get_twitter_alerts()
@@ -875,12 +875,12 @@ async def fud_status(ctx):
 async def test_twitter(ctx):
     """Test if Twitter API returns any tweets."""
     if not TWITTER_CLIENT:
-        await ctx.send("❌ Twitter client not configured. Please set BEARER_TOKEN.")
+        await ctx.send("❌ Twitter client not configured. Please set BEARER_TOKEN in .env.")
         return
     try:
         tweets = TWITTER_CLIENT.search_recent_tweets(
             query="crypto",
-            max_results=10  # minimum allowed
+            max_results=10
         )
         count = len(tweets.data) if tweets.data else 0
         if count > 0:
@@ -894,12 +894,12 @@ async def test_twitter(ctx):
 async def fud_debug(ctx):
     """Debug: show raw tweets from the FUD query without filtering."""
     if not TWITTER_CLIENT:
-        await ctx.send("❌ Twitter client not configured.")
+        await ctx.send("❌ Twitter client not configured. Please set BEARER_TOKEN in .env.")
         return
     await ctx.send("🔍 Fetching raw tweets with the FUD query...")
     query = (
         "(binance OR coinbase OR kraken OR bybit OR ftx OR okx OR huobi OR kucoin OR gate.io OR crypto.com OR exchange) "
-        "AND (withdraw* OR outflow* OR deposit* OR transfer* OR fud OR panic OR bank run OR insolvent OR freeze OR halt OR collapse OR hack OR scam OR rug) "
+        "AND (withdraw* OR outflow* OR deposit* OR transfer* OR fud OR panic OR bank run OR insolvent OR freeze OR halt OR collapse OR hack OR scam OR rug OR crash OR \"can't withdraw\" OR \"withdrawal issue\") "
         "-is:retweet -is:reply lang:en"
     )
     end_time = datetime.utcnow() - timedelta(seconds=30)
