@@ -74,29 +74,68 @@ def save_processed_ids(ids):
     with open(PROCESSED_FILE, "w") as f:
         json.dump(list(ids), f)
 
+# Exchanges we treat as "exchange-related" for !fud
+EXCHANGE_NAMES = [
+    "binance", "coinbase", "kraken", "bybit", "ftx", "okx", "huobi",
+    "kucoin", "gate.io", "gate io", "crypto.com", "hyperliquid", "bitget",
+    "mexc", "gemini", "bitfinex", "bitstamp", "upbit", "bithumb"
+]
+
+# Strong problem words that signal genuine exchange trouble (subset of FUD words,
+# excluding generic ones like "scam"/"rug" that mostly appear in shill/news noise).
+EXCHANGE_PROBLEM_WORDS = [
+    "bank run", "insolvent", "freeze withdrawals", "halt withdrawals",
+    "suspends withdrawals", "suspend withdrawals", "paused withdrawals",
+    "pause withdrawals", "liquidity crisis", "bankrupt", "collapse",
+    "hack", "exploit", "withdrawal issue", "can't withdraw",
+    "cannot withdraw", "withdrawal delay", "freeze", "halt"
+]
+
 def analyze_tweet(text):
-    # Improved regex: handles both 1,000 and 1000
-    pattern = r'(\d{1,3}(?:,\d{3})*|\d+)\s*(BTC|ETH|USDT|USDC|DAI|XRP|ADA|SOL|DOT|AVAX)'
+    """
+    Returns: (amount, unit, reason, category)
+      category is "exchange" (routed to !fud) or "news" (routed to !news).
+    """
+    text_lower = text.lower()
+    mentions_exchange = any(name in text_lower for name in EXCHANGE_NAMES)
+
+    # 1. Numeric large withdrawal
+    pattern = r'(\d{1,3}(?:,\d{3})*)\s*(BTC|ETH|USDT|USDC|DAI|XRP|ADA|SOL|DOT|AVAX)'
     for match in re.finditer(pattern, text, re.IGNORECASE):
         raw = match.group(1).replace(",", "")
         amount = float(raw)
         unit = match.group(2).upper()
         if amount >= WITHDRAWAL_THRESHOLD.get(unit, 0):
-            return amount, unit, "💰 Large Withdrawal"
-    text_lower = text.lower()
-    for word in FUD_TRIGGER_WORDS:
-        if word in text_lower:
-            return None, None, "🔥 FUD Panic Alert"
-    return None, None, None
+            # A large withdrawal tied to a named exchange is exchange FUD;
+            # otherwise it's general market news.
+            category = "exchange" if mentions_exchange else "news"
+            return amount, unit, "💰 Large Withdrawal", category
+
+    # 2. Exchange-specific FUD: named exchange AND a strong problem word
+    if mentions_exchange:
+        for word in EXCHANGE_PROBLEM_WORDS:
+            if word in text_lower:
+                return None, None, "🔥 Exchange FUD Alert", "exchange"
+
+    # 3. Everything else that came back from the search query is general crypto
+    #    news. The query itself already restricts results to crypto/exchange/FUD
+    #    topics, so we don't require an extra keyword here – that was too strict.
+    return None, None, "📰 Crypto News", "news"
 
 def fetch_twitter_fud_tweets():
     if not TWITTER_CLIENT:
         return []
+    
+    # X API v2 rules: implicit AND (space, not the word AND); no '*' wildcards inside terms.
+    # Multi-word phrases must be quoted ("bank run"). Clauses joined by a space = AND.
     query = (
         "(binance OR coinbase OR kraken OR bybit OR ftx OR okx OR huobi OR kucoin OR gate.io OR crypto.com OR exchange) "
-        "AND (withdraw* OR outflow* OR deposit* OR transfer* OR fud OR panic OR bank run OR insolvent OR freeze OR halt OR collapse OR hack OR scam OR rug OR crash OR \"can't withdraw\" OR \"withdrawal issue\") "
+        "(withdraw OR withdrawal OR withdrawals OR outflow OR outflows OR deposit OR transfer OR fud OR panic OR \"bank run\" OR insolvent OR freeze OR halt OR collapse OR hack OR scam OR rug) "
         "-is:retweet -is:reply lang:en"
     )
+    # X requires end_time to be at least 10s before the request time.
+    # Pull it back 30s to stay safely clear of any clock skew
+    
     end_time = datetime.utcnow() - timedelta(seconds=30)
     start_time = end_time - timedelta(hours=24)
     try:
@@ -114,31 +153,45 @@ def fetch_twitter_fud_tweets():
         print(f"❌ Twitter API error: {e}")
         return []
 
-async def get_twitter_alerts():
+async def get_twitter_alerts(category=None):
+    """Async wrapper – fetches new tweets and filters them.
+
+    category: "exchange" -> only exchange FUD (for !fud)
+              "news"     -> only general crypto news (for !news)
+              None       -> everything
+    Only tweets that are actually returned get marked processed, so !fud and
+    !news don't consume each other's tweets.
+    """
     processed = load_processed_ids()
     new_alerts = []
     tweets = await asyncio.to_thread(fetch_twitter_fud_tweets)
+
     for tweet in tweets:
         if tweet.id in processed:
             continue
-        amount, unit, reason = analyze_tweet(tweet.text)
+
+        amount, unit, reason, cat = analyze_tweet(tweet.text)
+        if reason is None:
+            continue  # no match at all; leave unprocessed so a broader run can catch it
+
+        if category is not None and cat != category:
+            continue  # matched, but not for this feed – leave for the other command
+
         if amount:
-            new_alerts.append({
-                "id": tweet.id,
-                "text": tweet.text[:200],
-                "url": f"https://twitter.com/i/web/status/{tweet.id}",
-                "detail": f"{amount:,.0f} {unit} - {reason}",
-                "created_at": tweet.created_at
-            })
-        elif unit is None and reason:
-            new_alerts.append({
-                "id": tweet.id,
-                "text": tweet.text[:200],
-                "url": f"https://twitter.com/i/web/status/{tweet.id}",
-                "detail": reason,
-                "created_at": tweet.created_at
-            })
+            detail = f"{amount:,.0f} {unit} - {reason}"
+        else:
+            detail = reason
+
+        new_alerts.append({
+            "id": tweet.id,
+            "text": tweet.text[:200],
+            "url": f"https://twitter.com/i/web/status/{tweet.id}",
+            "detail": detail,
+            "category": cat,
+            "created_at": tweet.created_at
+        })
         processed.add(tweet.id)
+
     save_processed_ids(processed)
     return new_alerts
 
@@ -192,7 +245,7 @@ async def send_twitter_fud_report():
     channel = bot.get_channel(int(channel_id))
     if not channel:
         return
-    alerts = await get_twitter_alerts()
+    alerts = await get_twitter_alerts(category="exchange")
     fud_last_run = datetime.utcnow()
     fud_last_count = len(alerts)
     if not alerts:
@@ -247,11 +300,13 @@ async def on_command_error(ctx, error):
 
 @bot.command()
 async def ping(ctx):
+    """Check bot latency"""
     latency = round(bot.latency * 1000)
     await ctx.send(f"🏓 Pong! Latency: {latency}ms")
 
 @bot.command()
 async def about(ctx):
+    """About Coin Escape"""
     embed = discord.Embed(
         title="🪙 Coin Escape",
         description="Emergency panic withdrawal app for crypto exchanges. "
@@ -267,6 +322,7 @@ async def about(ctx):
 
 @bot.command()
 async def security(ctx):
+    """Security model explanation"""
     embed = discord.Embed(
         title="🔐 Security Model",
         description="Coin Escape takes security seriously:",
@@ -290,8 +346,13 @@ async def security(ctx):
     embed.set_footer(text="Your keys, your control")
     await ctx.send(embed=embed)
 
+# ============================================
+# HELP COMMAND (FIXED - shows correct command names)
+# ============================================
+
 @bot.command()
 async def help(ctx):
+    """List all available commands"""
     embed = discord.Embed(
         title="📋 Coin Escape Commands",
         description="Here are all available commands:",
@@ -328,18 +389,27 @@ async def help(ctx):
         value="`!withdraw-status <coin>` - Check deposit/withdraw status\n"
               "`!track <network> <txid>` - Track ANY transaction (SOL, ETH, BTC, BSC)\n"
               "`!support` - Binance support links\n"
-              "`!coins` - Check top 10 coins deposit/withdraw status\n"
-              "`!fud` - Scan Twitter for exchange FUD/large withdrawals\n"
-              "`!fud_status` - Show status of the FUD alert system\n"
-              "`!test_twitter` - Test Twitter API connection\n"
-              "`!fud_debug` - Debug FUD query (raw tweets)",
+              "`!coins` - Check top 10 coins deposit/withdraw status",
+        inline=False
+    )
+    embed.add_field(
+        name="🚨 Alerts & News",
+        value="`!fud` - Exchange FUD & large withdrawal alerts (exchange-specific)\n"
+              "`!news` - Broader crypto news & market FUD\n"
+              "`!fud_status` - Status of the FUD alert system\n"
+              "`!test_twitter` - Check the Twitter/X API connection",
         inline=False
     )
     embed.set_footer(text="🔄 Automation features active")
     await ctx.send(embed=embed)
 
+# ============================================
+# TEST COMMANDS WITH COPY BUTTON
+# ============================================
+
 @bot.command()
 async def testcmds(ctx):
+    """Get a copyable list of test commands"""
     commands_text = (
         "!help\n"
         "!exchange_status\n"
@@ -348,10 +418,12 @@ async def testcmds(ctx):
         "!btc\n"
         "!ping"
     )
+    
     class CopyButton(discord.ui.View):
         @discord.ui.button(label="📋 Copy All Commands", style=discord.ButtonStyle.primary)
         async def copy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
             await interaction.response.send_message(f"```\n{commands_text}\n```", ephemeral=True)
+    
     embed = discord.Embed(
         title="📋 Test Commands",
         description="Click the button below to copy all test commands to your clipboard.",
@@ -359,19 +431,33 @@ async def testcmds(ctx):
     )
     await ctx.send(embed=embed, view=CopyButton())
 
+# ============================================
+# GUIDE, FAQ, STATUS, VERSION, COINFLIP, SERVER
+# ============================================
+
 @bot.command()
 async def guide(ctx):
+    """Getting started guide"""
     embed = discord.Embed(
         title="📖 Getting Started",
         description="Follow the complete setup guide on GitHub:",
         color=0xe67e22
     )
-    embed.add_field(name="🔗 Guide Link", value="https://github.com/chezdon0074/Coin-Escape-bot#readme", inline=False)
-    embed.add_field(name="📱 Mobile App", value="Available for iOS and Android via Expo", inline=False)
+    embed.add_field(
+        name="🔗 Guide Link",
+        value="https://github.com/chezdon0074/Coin-Escape-bot#readme",
+        inline=False
+    )
+    embed.add_field(
+        name="📱 Mobile App",
+        value="Available for iOS and Android via Expo",
+        inline=False
+    )
     await ctx.send(embed=embed)
 
 @bot.command()
 async def faq(ctx):
+    """Frequently asked questions"""
     embed = discord.Embed(
         title="❓ Frequently Asked Questions",
         color=0x9b59b6
@@ -400,6 +486,7 @@ async def faq(ctx):
 
 @bot.command()
 async def status(ctx):
+    """Check bot and app status"""
     embed = discord.Embed(
         title="🟢 Status",
         description="All systems operational",
@@ -413,15 +500,18 @@ async def status(ctx):
 
 @bot.command()
 async def version(ctx):
+    """Show current version"""
     await ctx.send(f"📦 Coin Escape v{APP_VERSION}")
 
 @bot.command()
 async def coinflip(ctx):
+    """Flip a coin"""
     result = random.choice(["Heads", "Tails"])
     await ctx.send(f"🪙 The coin landed on **{result}**!")
 
 @bot.command()
 async def server(ctx):
+    """Server info"""
     guild = ctx.guild
     embed = discord.Embed(
         title=f"🛡️ {guild.name}",
@@ -436,8 +526,13 @@ async def server(ctx):
         embed.set_thumbnail(url=guild.icon.url)
     await ctx.send(embed=embed)
 
+# ============================================
+# EXCHANGE COMMANDS
+# ============================================
+
 @bot.command()
 async def exchanges(ctx):
+    """List supported exchanges"""
     exchanges = "\n".join([f"• {ex}" for ex in SUPPORTED_EXCHANGES])
     embed = discord.Embed(
         title="🏦 Supported Exchanges",
@@ -447,8 +542,14 @@ async def exchanges(ctx):
     embed.set_footer(text=f"{len(SUPPORTED_EXCHANGES)} exchanges supported")
     await ctx.send(embed=embed)
 
+# ============================================
+# EXCHANGE STATUS SCANNER (ONLINE/OFFLINE)
+# ============================================
+
 @bot.command()
 async def exchange_status(ctx, exchange: str = None):
+    """Check if an exchange is online (simplified, reliable)"""
+    
     if exchange:
         exchange = exchange.lower()
         if exchange == "binance":
@@ -493,36 +594,52 @@ async def exchange_status(ctx, exchange: str = None):
         else:
             await ctx.send(f"❌ Unknown exchange. Try: `binance`, `bybit`, `coinbase`")
             return
+    
     # Show all exchanges
     embed = discord.Embed(
         title="🔌 Exchange Status",
         description="Checking if exchanges are online...",
         color=0x3498db
     )
+    
+    # Check Binance
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get("https://api.binance.com/api/v3/ping", timeout=5) as resp:
                 embed.add_field(name="Binance", value="🟢 Online" if resp.status == 200 else "🔴 Offline", inline=True)
     except:
         embed.add_field(name="Binance", value="🔴 Offline", inline=True)
+    
+    # Check Bybit
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get("https://api.bybit.com/v5/system/time", timeout=5) as resp:
                 embed.add_field(name="Bybit", value="🟢 Online" if resp.status == 200 else "🔴 Offline", inline=True)
     except:
         embed.add_field(name="Bybit", value="🔴 Offline", inline=True)
+    
+    # Check Coinbase
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get("https://api.coinbase.com/v2/time", timeout=5) as resp:
                 embed.add_field(name="Coinbase", value="🟢 Online" if resp.status == 200 else "🔴 Offline", inline=True)
     except:
         embed.add_field(name="Coinbase", value="🔴 Offline", inline=True)
+    
     embed.set_footer(text=f"Last checked: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
     await ctx.send(embed=embed)
 
+# ============================================
+# COINS SCANNER (TOP 10 DEPOSIT/WITHDRAW STATUS)
+# ============================================
+
 @bot.command()
 async def coins(ctx):
+    """Check deposit/withdrawal status for top 10 coins"""
+    
+    # Top 10 coins to check
     coin_list = ["BTC", "ETH", "USDT", "BNB", "SOL", "XRP", "ADA", "DOGE", "DOT", "AVAX"]
+    
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get("https://api.binance.com/api/v3/capital/config/getall") as resp:
@@ -533,11 +650,14 @@ async def coins(ctx):
         except:
             await ctx.send("❌ Error connecting to Binance API.")
             return
+    
+    # Build the embed
     embed = discord.Embed(
         title="🪙 Binance Coin Status (Top 10)",
         description="Deposit & Withdrawal status for the most popular coins",
         color=0xf0b90b
     )
+    
     status_text = ""
     for coin_name in coin_list:
         coin_data = None
@@ -545,31 +665,55 @@ async def coins(ctx):
             if item['coin'] == coin_name:
                 coin_data = item
                 break
+        
         if not coin_data:
             status_text += f"**{coin_name}** ❌ No data\n"
             continue
+        
         network_list = coin_data.get('networkList', [])
         if not network_list:
             status_text += f"**{coin_name}** ❌ No networks\n"
             continue
+        
+        # Check if any network has deposit/withdraw enabled
         deposit_enabled = any(n.get('depositEnable', False) for n in network_list)
         withdraw_enabled = any(n.get('withdrawEnable', False) for n in network_list)
+        
         deposit_emoji = "✅" if deposit_enabled else "❌"
         withdraw_emoji = "✅" if withdraw_enabled else "❌"
+        
         status_text += f"**{coin_name}** {deposit_emoji} Deposit  {withdraw_emoji} Withdraw\n"
+    
     embed.add_field(name="Status", value=status_text, inline=False)
     embed.set_footer(text=f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    
     await ctx.send(embed=embed)
+
+# ============================================
+# PRICE COMMANDS
+# ============================================
 
 @bot.command()
 async def price(ctx, coin: str = "bitcoin"):
+    """Get current crypto price (bitcoin, ethereum, solana, etc.)"""
     coin = coin.lower()
+    
+    # Map common names to CoinGecko IDs
     coin_map = {
-        "btc": "bitcoin", "eth": "ethereum", "sol": "solana",
-        "ada": "cardano", "dot": "polkadot", "avax": "avalanche-2",
-        "matic": "polygon", "link": "chainlink", "uni": "uniswap", "doge": "dogecoin"
+        "btc": "bitcoin",
+        "eth": "ethereum",
+        "sol": "solana",
+        "ada": "cardano",
+        "dot": "polkadot",
+        "avax": "avalanche-2",
+        "matic": "polygon",
+        "link": "chainlink",
+        "uni": "uniswap",
+        "doge": "dogecoin"
     }
+    
     coin_id = coin_map.get(coin, coin)
+    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -579,13 +723,17 @@ async def price(ctx, coin: str = "bitcoin"):
                     await ctx.send(f"❌ Could not find coin: `{coin}`")
                     return
                 data = await resp.json()
+                
                 if coin_id not in data:
                     await ctx.send(f"❌ Could not find coin: `{coin}`")
                     return
+                
                 price = data[coin_id]['usd']
                 change = data[coin_id].get('usd_24h_change', 0)
+                
                 emoji = "📈" if change >= 0 else "📉"
                 change_str = f"+{change:.2f}%" if change >= 0 else f"{change:.2f}%"
+                
                 embed = discord.Embed(
                     title=f"💰 {coin.upper()} Price",
                     description=f"**${price:,.2f}**",
@@ -595,27 +743,39 @@ async def price(ctx, coin: str = "bitcoin"):
                 embed.add_field(name="Source", value="CoinGecko", inline=True)
                 embed.set_footer(text=f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 await ctx.send(embed=embed)
+    
     except:
         await ctx.send("❌ Error fetching price data. Please try again.")
 
 @bot.command()
 async def btc(ctx):
+    """Get Bitcoin price"""
     await price(ctx, "bitcoin")
 
 @bot.command()
 async def eth(ctx):
+    """Get Ethereum price"""
     await price(ctx, "ethereum")
 
 @bot.command()
 async def sol(ctx):
+    """Get Solana price"""
     await price(ctx, "solana")
+
+# ============================================
+# BINANCE NETWORK STATUS (ONE COIN)
+# ============================================
 
 @bot.command()
 async def withdraw_status(ctx, coin: str = None):
+    """Check deposit/withdrawal status for a specific coin (e.g., !withdraw-status BTC)"""
+    
     if not coin:
         await ctx.send("❌ Please specify a coin. Example: `!withdraw-status BTC` or `!withdraw-status ETH`")
         return
+    
     coin = coin.upper()
+    
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get("https://api.binance.com/api/v3/capital/config/getall") as resp:
@@ -626,20 +786,27 @@ async def withdraw_status(ctx, coin: str = None):
         except:
             await ctx.send("❌ Error connecting to Binance API.")
             return
+    
+    # Find the coin
     coin_data = None
     for item in data:
         if item['coin'] == coin:
             coin_data = item
             break
+    
     if not coin_data:
         await ctx.send(f"❌ No network information found for **{coin}**. Please check the symbol (e.g., BTC, ETH, SOL).")
         return
+    
+    # Build the embed
     embed = discord.Embed(
         title=f"🌐 {coin} Network Status",
         description=f"Deposit & Withdrawal status for **{coin}**",
         color=0xf0b90b
     )
+    
     network_list = coin_data.get('networkList', [])
+    
     if not network_list:
         embed.add_field(name="⚠️ No networks available", value="No network data found for this coin.", inline=False)
     else:
@@ -647,23 +814,37 @@ async def withdraw_status(ctx, coin: str = None):
             network_name = network.get('network', 'Unknown')
             deposit = network.get('depositEnable', False)
             withdraw = network.get('withdrawEnable', False)
+            
             deposit_emoji = "✅" if deposit else "❌"
             withdraw_emoji = "✅" if withdraw else "❌"
+            
             status_text = f"**Deposit:** {deposit_emoji} | **Withdraw:** {withdraw_emoji}"
+            
             min_confirm = network.get('minConfirm', 'N/A')
             if min_confirm != 'N/A':
                 status_text += f"\n`Confirmations: {min_confirm}`"
+            
             embed.add_field(
                 name=f"**{network_name}**",
                 value=status_text,
                 inline=False
             )
+    
     embed.set_footer(text=f"Data provided by Binance | Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
     await ctx.send(embed=embed)
 
+# ============================================
+# ADVANCED TRANSACTION TRACKING
+# ============================================
+
 @bot.command()
 async def track(ctx, network: str, txid: str):
+    """Track ANY transaction on Solana, Ethereum, BSC, Bitcoin, etc.
+    Usage: !track SOL 5W... or !track ETH 0x..."""
+    
     network = network.lower()
+    
+    # Network configurations
     explorers = {
         "sol": {
             "name": "Solana",
@@ -690,12 +871,17 @@ async def track(ctx, network: str, txid: str):
             "type": "blockchain"
         }
     }
+    
     if network not in explorers:
         networks_list = "\n".join([f"• {key.upper()}" for key in explorers.keys()])
         await ctx.send(f"❌ Unknown network. Available:\n{networks_list}")
         return
+    
     explorer = explorers[network]
+    
+    # Show initial loading message
     loading_msg = await ctx.send(f"🔍 Searching **{explorer['name']}** for transaction...")
+    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(explorer['url']) as resp:
@@ -703,7 +889,10 @@ async def track(ctx, network: str, txid: str):
                     await loading_msg.edit(content=f"❌ Transaction not found on {explorer['name']}. Check the TXID and try again.")
                     return
                 data = await resp.json()
+        
+        # Different parsing logic for each explorer
         if explorer['type'] == "solscan":
+            # Solana
             if not data or data.get('success') == False:
                 await loading_msg.edit(content=f"❌ Transaction not found on Solana.")
                 return
@@ -715,6 +904,7 @@ async def track(ctx, network: str, txid: str):
             from_addr = tx_data.get('from', 'N/A')
             to_addr = tx_data.get('to', 'N/A')
             fee = tx_data.get('fee', 0) / 1e9
+            
             embed = discord.Embed(
                 title=f"🔍 Solana Transaction",
                 description=f"Status: {status}",
@@ -728,16 +918,19 @@ async def track(ctx, network: str, txid: str):
             embed.add_field(name="⛽ Fee", value=f"{fee:.6f} SOL", inline=True)
             embed.add_field(name="🔗 Explorer", value=f"[View on Solscan]({explorer['view']})", inline=False)
             embed.set_footer(text=f"TXID: {txid[:16]}...")
-            await loading_msg.edit(content=None, embed=embed)
+            
         elif explorer['type'] == "blockchain":
+            # Bitcoin
             if not data:
                 await loading_msg.edit(content=f"❌ Transaction not found on Bitcoin.")
                 return
+            
             status = "✅ SUCCESS"
             amount = sum([out.get('value', 0) for out in data.get('out', [])]) / 1e8
             timestamp = datetime.fromtimestamp(data.get('time', 0)).strftime('%Y-%m-%d %H:%M:%S UTC')
             confirmations = data.get('block_height', 'N/A')
             fee = data.get('fee', 0) / 1e8
+            
             embed = discord.Embed(
                 title=f"🔍 Bitcoin Transaction",
                 description=f"Status: {status}",
@@ -749,8 +942,9 @@ async def track(ctx, network: str, txid: str):
             embed.add_field(name="⛽ Fee", value=f"{fee:.8f} BTC", inline=True)
             embed.add_field(name="🔗 Explorer", value=f"[View on Blockchain.com]({explorer['view']})", inline=False)
             embed.set_footer(text=f"TXID: {txid[:16]}...")
-            await loading_msg.edit(content=None, embed=embed)
+        
         else:
+            # Ethereum / BSC - Simplified
             embed = discord.Embed(
                 title=f"🔍 {explorer['name']} Transaction",
                 description="Click the link below to view full details on the explorer.",
@@ -758,13 +952,22 @@ async def track(ctx, network: str, txid: str):
             )
             embed.add_field(name="🔗 View on Explorer", value=f"[Click here to view]({explorer['view']})", inline=False)
             embed.set_footer(text=f"TXID: {txid[:16]}...")
-            await loading_msg.edit(content=None, embed=embed)
+        
+        await loading_msg.edit(content=None, embed=embed)
+    
     except Exception as e:
         await loading_msg.edit(content=f"❌ Error fetching transaction: {str(e)}")
 
+# ============================================
+# SUPPORT COMMAND
+# ============================================
+
 @bot.command()
 async def support(ctx, withdrawal_id: str = None):
+    """Get direct Binance support link for a withdrawal"""
+    
     if not withdrawal_id:
+        # Show general support links
         embed = discord.Embed(
             title="🆘 Binance Withdrawal Support",
             description="Need help with a withdrawal? Here are the official support links:",
@@ -789,7 +992,10 @@ async def support(ctx, withdrawal_id: str = None):
         )
         await ctx.send(embed=embed)
         return
+    
+    # Support link with withdrawal ID
     support_url = f"https://www.binance.com/en/support/ticket?withdrawal_id={withdrawal_id}"
+    
     embed = discord.Embed(
         title="🆘 Withdrawal Support",
         description=f"Direct support link for Withdrawal ID: **{withdrawal_id}**",
@@ -806,6 +1012,7 @@ async def support(ctx, withdrawal_id: str = None):
         inline=False
     )
     embed.set_footer(text="🚨 Contact support immediately for any issues with your funds.")
+    
     await ctx.send(embed=embed)
 
 # ============================================
@@ -814,18 +1021,46 @@ async def support(ctx, withdrawal_id: str = None):
 
 @bot.command()
 async def fud(ctx):
+    """Manually check for recent EXCHANGE FUD / large withdrawal tweets."""
     if not TWITTER_CLIENT:
         await ctx.send("❌ Twitter API not configured. Please set BEARER_TOKEN in .env.")
         return
     await ctx.send("🔍 Scanning Twitter for exchange FUD and large withdrawals...")
-    alerts = await get_twitter_alerts()
+    alerts = await get_twitter_alerts(category="exchange")
     if not alerts:
-        await ctx.send("✅ No new large withdrawal or FUD tweets in the last 24 hours.")
+        await ctx.send("✅ No new exchange FUD or large withdrawal tweets in the last 24 hours.")
         return
     embed = discord.Embed(
         title="🚨 Exchange FUD & Large Withdrawal Alerts",
-        description=f"Found **{len(alerts)}** new alerts:",
+        description=f"Found **{len(alerts)}** exchange-related alerts:",
         color=0xff5500,
+        timestamp=datetime.utcnow()
+    )
+    for alert in alerts[:10]:
+        embed.add_field(
+            name=f"{alert['detail']}",
+            value=f"{alert['text']}... [Link]({alert['url']})",
+            inline=False
+        )
+    if len(alerts) > 10:
+        embed.set_footer(text=f"Showing first 10 of {len(alerts)} alerts")
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def news(ctx):
+    """Manually check for broader crypto news / FUD tweets (non-exchange)."""
+    if not TWITTER_CLIENT:
+        await ctx.send("❌ Twitter API not configured. Please set BEARER_TOKEN.")
+        return
+    await ctx.send("📰 Scanning Twitter for general crypto news and FUD...")
+    alerts = await get_twitter_alerts(category="news")
+    if not alerts:
+        await ctx.send("✅ No new crypto news tweets in the last 24 hours.")
+        return
+    embed = discord.Embed(
+        title="📰 Crypto News & Market FUD",
+        description=f"Found **{len(alerts)}** news items:",
+        color=0x3498db,
         timestamp=datetime.utcnow()
     )
     for alert in alerts[:10]:
