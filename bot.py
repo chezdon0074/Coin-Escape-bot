@@ -14,6 +14,8 @@ import json
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 BEARER_TOKEN = os.getenv('BEARER_TOKEN')   # Read from .env – no fallback
+ETHERSCAN_KEY = os.getenv('ETHERSCAN_API_KEY', '')   # Optional but recommended for !track ETH
+BSCSCAN_KEY = os.getenv('BSCSCAN_API_KEY', '')       # Optional but recommended for !track BSC
 
 # Bot configuration
 intents = discord.Intents.all()
@@ -22,6 +24,19 @@ bot.remove_command('help')
 
 APP_VERSION = "2.1.0"
 SUPPORTED_EXCHANGES = ["Binance", "Bybit", "Coinbase", "Kraken", "KuCoin", "OKX", "Hyperliquid"]
+
+# ============================================
+# PERMISSION CHECK – VIP / ADMIN ROLES
+# ============================================
+
+ALLOWED_ROLES = {"vip", "admin"}  # Case-insensitive
+
+def has_permission(ctx):
+    """Check if user has a VIP/Admin role or is a server administrator."""
+    if ctx.author.guild_permissions.administrator:
+        return True
+    user_roles = {role.name.lower() for role in ctx.author.roles}
+    return bool(user_roles.intersection(ALLOWED_ROLES))
 
 # ============================================
 # TWITTER FUD / LARGE WITHDRAWAL ALERTS
@@ -81,8 +96,7 @@ EXCHANGE_NAMES = [
     "mexc", "gemini", "bitfinex", "bitstamp", "upbit", "bithumb"
 ]
 
-# Strong problem words that signal genuine exchange trouble (subset of FUD words,
-# excluding generic ones like "scam"/"rug" that mostly appear in shill/news noise).
+# Strong problem words that signal genuine exchange trouble
 EXCHANGE_PROBLEM_WORDS = [
     "bank run", "insolvent", "freeze withdrawals", "halt withdrawals",
     "suspends withdrawals", "suspend withdrawals", "paused withdrawals",
@@ -106,8 +120,6 @@ def analyze_tweet(text):
         amount = float(raw)
         unit = match.group(2).upper()
         if amount >= WITHDRAWAL_THRESHOLD.get(unit, 0):
-            # A large withdrawal tied to a named exchange is exchange FUD;
-            # otherwise it's general market news.
             category = "exchange" if mentions_exchange else "news"
             return amount, unit, "💰 Large Withdrawal", category
 
@@ -117,25 +129,19 @@ def analyze_tweet(text):
             if word in text_lower:
                 return None, None, "🔥 Exchange FUD Alert", "exchange"
 
-    # 3. Everything else that came back from the search query is general crypto
-    #    news. The query itself already restricts results to crypto/exchange/FUD
-    #    topics, so we don't require an extra keyword here – that was too strict.
+    # 3. Everything else that came back from the search query is general crypto news
     return None, None, "📰 Crypto News", "news"
 
 def fetch_twitter_fud_tweets():
     if not TWITTER_CLIENT:
         return []
     
-    # X API v2 rules: implicit AND (space, not the word AND); no '*' wildcards inside terms.
-    # Multi-word phrases must be quoted ("bank run"). Clauses joined by a space = AND.
+    # X API v2 rules: implicit AND (space), no '*' wildcards.
     query = (
         "(binance OR coinbase OR kraken OR bybit OR ftx OR okx OR huobi OR kucoin OR gate.io OR crypto.com OR exchange) "
         "(withdraw OR withdrawal OR withdrawals OR outflow OR outflows OR deposit OR transfer OR fud OR panic OR \"bank run\" OR insolvent OR freeze OR halt OR collapse OR hack OR scam OR rug) "
         "-is:retweet -is:reply lang:en"
     )
-    # X requires end_time to be at least 10s before the request time.
-    # Pull it back 30s to stay safely clear of any clock skew
-    
     end_time = datetime.utcnow() - timedelta(seconds=30)
     start_time = end_time - timedelta(hours=24)
     try:
@@ -159,8 +165,6 @@ async def get_twitter_alerts(category=None):
     category: "exchange" -> only exchange FUD (for !fud)
               "news"     -> only general crypto news (for !news)
               None       -> everything
-    Only tweets that are actually returned get marked processed, so !fud and
-    !news don't consume each other's tweets.
     """
     processed = load_processed_ids()
     new_alerts = []
@@ -172,10 +176,10 @@ async def get_twitter_alerts(category=None):
 
         amount, unit, reason, cat = analyze_tweet(tweet.text)
         if reason is None:
-            continue  # no match at all; leave unprocessed so a broader run can catch it
+            continue
 
         if category is not None and cat != category:
-            continue  # matched, but not for this feed – leave for the other command
+            continue
 
         if amount:
             detail = f"{amount:,.0f} {unit} - {reason}"
@@ -347,7 +351,7 @@ async def security(ctx):
     await ctx.send(embed=embed)
 
 # ============================================
-# HELP COMMAND (FIXED - shows correct command names)
+# HELP COMMAND
 # ============================================
 
 @bot.command()
@@ -393,11 +397,12 @@ async def help(ctx):
         inline=False
     )
     embed.add_field(
-        name="🚨 Alerts & News",
+        name="🚨 Alerts & News (VIP/Admin only)",
         value="`!fud` - Exchange FUD & large withdrawal alerts (exchange-specific)\n"
               "`!news` - Broader crypto news & market FUD\n"
               "`!fud_status` - Status of the FUD alert system\n"
-              "`!test_twitter` - Check the Twitter/X API connection",
+              "`!test_twitter` - Check the Twitter/X API connection\n"
+              "`!fud_debug` - Debug raw tweets from the FUD query",
         inline=False
     )
     embed.set_footer(text="🔄 Automation features active")
@@ -543,7 +548,7 @@ async def exchanges(ctx):
     await ctx.send(embed=embed)
 
 # ============================================
-# EXCHANGE STATUS SCANNER (ONLINE/OFFLINE)
+# EXCHANGE STATUS SCANNER
 # ============================================
 
 @bot.command()
@@ -834,7 +839,7 @@ async def withdraw_status(ctx, coin: str = None):
     await ctx.send(embed=embed)
 
 # ============================================
-# ADVANCED TRANSACTION TRACKING
+# ADVANCED TRANSACTION TRACKING (with API keys)
 # ============================================
 
 @bot.command()
@@ -844,7 +849,7 @@ async def track(ctx, network: str, txid: str):
     
     network = network.lower()
     
-    # Network configurations
+    # Build explorer URLs with API keys from environment
     explorers = {
         "sol": {
             "name": "Solana",
@@ -854,13 +859,13 @@ async def track(ctx, network: str, txid: str):
         },
         "eth": {
             "name": "Ethereum",
-            "url": f"https://api.etherscan.io/api?module=transaction&action=gettxreceiptstatus&txhash={txid}&apikey=YourEtherscanKey",
+            "url": f"https://api.etherscan.io/api?module=transaction&action=gettxreceiptstatus&txhash={txid}&apikey={ETHERSCAN_KEY}",
             "view": f"https://etherscan.io/tx/{txid}",
             "type": "etherscan"
         },
         "bsc": {
             "name": "BNB Smart Chain",
-            "url": f"https://api.bscscan.com/api?module=transaction&action=gettxreceiptstatus&txhash={txid}&apikey=YourBscScanKey",
+            "url": f"https://api.bscscan.com/api?module=transaction&action=gettxreceiptstatus&txhash={txid}&apikey={BSCSCAN_KEY}",
             "view": f"https://bscscan.com/tx/{txid}",
             "type": "bscscan"
         },
@@ -944,7 +949,7 @@ async def track(ctx, network: str, txid: str):
             embed.set_footer(text=f"TXID: {txid[:16]}...")
         
         else:
-            # Ethereum / BSC - Simplified
+            # Ethereum / BSC - Simplified (requires API key)
             embed = discord.Embed(
                 title=f"🔍 {explorer['name']} Transaction",
                 description="Click the link below to view full details on the explorer.",
@@ -1016,15 +1021,20 @@ async def support(ctx, withdrawal_id: str = None):
     await ctx.send(embed=embed)
 
 # ============================================
-# NEW FUD COMMANDS
+# TWITTER/X FUD & NEWS COMMANDS (VIP/Admin only)
 # ============================================
 
 @bot.command()
 async def fud(ctx):
     """Manually check for recent EXCHANGE FUD / large withdrawal tweets."""
+    if not has_permission(ctx):
+        await ctx.send("❌ You need the **VIP** or **Admin** role to use this command.")
+        return
+
     if not TWITTER_CLIENT:
         await ctx.send("❌ Twitter API not configured. Please set BEARER_TOKEN in .env.")
         return
+
     await ctx.send("🔍 Scanning Twitter for exchange FUD and large withdrawals...")
     alerts = await get_twitter_alerts(category="exchange")
     if not alerts:
@@ -1049,9 +1059,14 @@ async def fud(ctx):
 @bot.command()
 async def news(ctx):
     """Manually check for broader crypto news / FUD tweets (non-exchange)."""
+    if not has_permission(ctx):
+        await ctx.send("❌ You need the **VIP** or **Admin** role to use this command.")
+        return
+
     if not TWITTER_CLIENT:
         await ctx.send("❌ Twitter API not configured. Please set BEARER_TOKEN.")
         return
+
     await ctx.send("📰 Scanning Twitter for general crypto news and FUD...")
     alerts = await get_twitter_alerts(category="news")
     if not alerts:
@@ -1075,6 +1090,11 @@ async def news(ctx):
 
 @bot.command()
 async def fud_status(ctx):
+    """Show status of the FUD alert system."""
+    if not has_permission(ctx):
+        await ctx.send("❌ You need the **VIP** or **Admin** role to use this command.")
+        return
+
     embed = discord.Embed(
         title="📊 FUD Alert System Status",
         color=0x3498db
@@ -1109,6 +1129,10 @@ async def fud_status(ctx):
 @bot.command()
 async def test_twitter(ctx):
     """Test if Twitter API returns any tweets."""
+    if not has_permission(ctx):
+        await ctx.send("❌ You need the **VIP** or **Admin** role to use this command.")
+        return
+
     if not TWITTER_CLIENT:
         await ctx.send("❌ Twitter client not configured. Please set BEARER_TOKEN in .env.")
         return
@@ -1128,13 +1152,18 @@ async def test_twitter(ctx):
 @bot.command()
 async def fud_debug(ctx):
     """Debug: show raw tweets from the FUD query without filtering."""
+    if not has_permission(ctx):
+        await ctx.send("❌ You need the **VIP** or **Admin** role to use this command.")
+        return
+
     if not TWITTER_CLIENT:
         await ctx.send("❌ Twitter client not configured. Please set BEARER_TOKEN in .env.")
         return
     await ctx.send("🔍 Fetching raw tweets with the FUD query...")
+    # Fixed: removed invalid '*' wildcard
     query = (
         "(binance OR coinbase OR kraken OR bybit OR ftx OR okx OR huobi OR kucoin OR gate.io OR crypto.com OR exchange) "
-        "AND (withdraw* OR outflow* OR deposit* OR transfer* OR fud OR panic OR bank run OR insolvent OR freeze OR halt OR collapse OR hack OR scam OR rug OR crash OR \"can't withdraw\" OR \"withdrawal issue\") "
+        "AND (withdraw OR outflow OR deposit OR transfer OR fud OR panic OR bank run OR insolvent OR freeze OR halt OR collapse OR hack OR scam OR rug OR crash OR \"can't withdraw\" OR \"withdrawal issue\") "
         "-is:retweet -is:reply lang:en"
     )
     end_time = datetime.utcnow() - timedelta(seconds=30)
